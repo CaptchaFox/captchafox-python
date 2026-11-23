@@ -1,0 +1,107 @@
+name: Release
+
+# Runs when a version tag is pushed: checks, tests and builds the version, publishes it to PyPI, then creates the
+# GitHub release. Tags on a commit that is not on main, or whose version or changelog does not match, are refused
+# before anything is published. Only the jobs that publish hold the permissions to do so.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+concurrency: release
+
+jobs:
+  build:
+    name: Build ${{ github.ref_name }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so that the check below can see whether the tag is on main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check that the tag points to a commit on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points to $(git rev-parse --short HEAD), which is not on main. Tag the tested commit on main."
+            exit 1
+          fi
+
+      # The oldest supported version, as the release gate; without a cache, so that nothing from another run enters
+      # the published artifacts.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Check the version in pyproject.toml and the changelog
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/notes.md"
+
+      - name: Test
+        run: make test
+
+      - name: Build
+        run: |
+          python -m pip install build==1.6.1
+          make build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: ${{ runner.temp }}/notes.md
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ github.ref_name }} to PyPI
+    needs: build
+    runs-on: ubuntu-24.04
+    # The environment the trusted publisher on PyPI names.
+    environment: pypi
+    permissions:
+      # Trusted publishing to PyPI.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  github-release:
+    name: Create the GitHub release ${{ github.ref_name }}
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      # Creates the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notes
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/captchafox_python-${version}-py3-none-any.whl" \
+            "dist/captchafox_python-${version}.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "CaptchaFox for Python ${version}" \
+            --notes-file notes.md
